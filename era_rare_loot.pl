@@ -1,5 +1,4 @@
-package plugin;
-
+♂package plugin;
 
 use DBI;
 
@@ -20,7 +19,21 @@ use DBI;
 #           min_loot_chance => 20.0,  # only include items with >= 20% base chance
 #           proc_chance_pct => 3.0,   # % chance per spawn to even try for rare
 #           rolls           => 1,     # max rares per spawn
-#           debug           => 0      # set 1 while testing
+#           debug           => 0,     # set 1 while testing
+#
+#           # NEW: blacklist options
+#           # Completely block by zone shortname:
+#           # blacklist_zones        => [ 'poknowledge', 'guildlobby' ],
+#           #
+#           # Block specific versions for specific zones (spawn2.version):
+#           # blacklist_zone_versions => {
+#           #     hole    => [1],      # block hole version 1
+#           #     soldungb => [2],     # block soldungb version 2
+#           # },
+#           #
+#           # Block ALL zones where spawn2.version is in this list:
+#           # (perfect for "all custom zones are version 1" use case)
+#           # blacklist_any_versions => [1],
 #       );
 #   }
 #
@@ -38,7 +51,7 @@ our $EGL_DBI_EXTRA = $ENV{DBI_EXTRA} // 'mysql_enable_utf8=1';
 
 # Caches
 our %EGL_ZONE_ERA_CACHE;   # zonesn -> era
-our %EGL_ERA_POOL_CACHE;   # "era:min" -> [ { item_id, chance }, ... ]
+our %EGL_ERA_POOL_CACHE;   # "era:min:filter" -> [ { item_id, chance }, ... ]
 
 # ----------------------------------------------------------
 # Internal: DB handle
@@ -78,27 +91,28 @@ sub _egl_is_named {
 }
 
 # ----------------------------------------------------------
-# Internal: zonesn for this NPC (via spawn2.id)
+# Internal: zonesn + version for this NPC (via spawn2.id)
+#   Returns: (zonesn, version)
 # ----------------------------------------------------------
-sub _egl_zonesn_for_npc {
+sub _egl_zoneinfo_for_npc {
     my ($npc) = @_;
     my $dbh = _egl_dbh() or return;
 
     my $spawn2_id = eval { $npc->GetSpawnPointID() } || 0;
     return unless $spawn2_id;
 
-    my $zonesn;
+    my ($zonesn, $version);
     eval {
-        my $sth = $dbh->prepare("SELECT zone FROM spawn2 WHERE id = ? LIMIT 1");
+        my $sth = $dbh->prepare("SELECT zone, version FROM spawn2 WHERE id = ? LIMIT 1");
         $sth->execute($spawn2_id);
-        ($zonesn) = $sth->fetchrow_array();
+        ($zonesn, $version) = $sth->fetchrow_array();
         $sth->finish;
     };
     if ($@) {
-        quest::debug("era_global_rare_loot: zonesn query failed: $@");
+        quest::debug("era_global_rare_loot: zoneinfo query failed: $@");
         return;
     }
-    return $zonesn || undef;
+    return ($zonesn // undef, defined $version ? $version : undef);
 }
 
 # ----------------------------------------------------------
@@ -132,9 +146,6 @@ sub _egl_era_from_zone {
     return $era;
 }
 
-# ----------------------------------------------------------
-# Internal: era-global loot pool (all zones in that era)
-# ----------------------------------------------------------
 # ----------------------------------------------------------
 # Internal: era-global loot pool (all zones in that era)
 #   Only items that:
@@ -204,7 +215,6 @@ sub _egl_era_pool {
     $EGL_ERA_POOL_CACHE{$key} = $rows;
     return $rows;
 }
-
 
 # ----------------------------------------------------------
 # Internal: weighted random pick by 'chance'
@@ -281,7 +291,45 @@ sub _egl_is_valid_target {
     return 1;
 }
 
+# ----------------------------------------------------------
+# Internal: blacklist helper
+#   - blacklist_zones        => [ 'shortname', ... ]
+#   - blacklist_zone_versions => { shortname => [version, ...], ... }
+#   - blacklist_any_versions => [version, ...]   # applies to ALL zones
+# ----------------------------------------------------------
+sub _egl_is_blacklisted {
+    my ($zonesn, $version, $opt) = @_;
+    $opt ||= {};
 
+    # --- Zone shortname blacklist ---
+    if ($zonesn) {
+        my $zl = $opt->{blacklist_zones} || [];
+        if (@$zl) {
+            my %z = map { $_ => 1 } @$zl;
+            return 1 if $z{$zonesn};
+        }
+    }
+
+    # --- Global version blacklist: ANY zone with these versions ---
+    if (defined $version) {
+        my $gv = $opt->{blacklist_any_versions} || [];
+        if (@$gv) {
+            my %v = map { int($_) => 1 } @$gv;
+            return 1 if $v{ int($version) };
+        }
+    }
+
+    # --- Per-zone version blacklist ---
+    if ($zonesn && defined $version) {
+        my $zv = $opt->{blacklist_zone_versions} || {};
+        if (exists $zv->{$zonesn}) {
+            my %v = map { int($_) => 1 } @{ $zv->{$zonesn} || [] };
+            return 1 if $v{ int($version) };
+        }
+    }
+
+    return 0;
+}
 
 # ----------------------------------------------------------
 # Public: call from EVENT_SPAWN
@@ -322,6 +370,28 @@ sub era_global_rare_loot_on_spawn {
         return;
     }
 
+    # Determine zone + version
+    my ($zonesn, $version) = _egl_zoneinfo_for_npc($npc);
+    if ($debug) {
+        quest::shout(
+            "[EraGlobalLoot] zone="
+            . ($zonesn  // 'UNKNOWN')
+            . " version="
+            . (defined $version ? $version : 'NULL')
+        );
+    }
+
+    # Blacklist check
+    if (_egl_is_blacklisted($zonesn, $version, \%opt)) {
+        quest::shout(
+            "[EraGlobalLoot] BLACKLISTED zone="
+            . ($zonesn  // 'UNKNOWN')
+            . " version="
+            . (defined $version ? $version : 'NULL')
+        ) if $debug;
+        return;
+    }
+
     # Early debug so we KNOW the plugin ran
     if ($debug) {
         quest::shout(
@@ -353,12 +423,7 @@ sub era_global_rare_loot_on_spawn {
         }
     }
 
-    # Determine zone + era
-    my $zonesn = _egl_zonesn_for_npc($npc);
-    if ($debug) {
-        quest::shout("[EraGlobalLoot] zonesn=" . ($zonesn // 'UNKNOWN'));
-    }
-
+    # Determine era (or override)
     my $era = $era_override || _egl_era_from_zone($zonesn);
     if (!$era) {
         quest::shout("[EraGlobalLoot] ERA LOOKUP FAILED for zonesn=" . ($zonesn // 'UNKNOWN')) if $debug;
@@ -386,9 +451,10 @@ sub era_global_rare_loot_on_spawn {
 
         if ($debug) {
             my $msg = sprintf(
-                "[EraGlobalLoot] ADD %s(%d) lvl %d in %s era=%s -> item %d",
+                "[EraGlobalLoot] ADD %s(%d) lvl %d in %s(v%d) era=%s -> item %d",
                 $npc_name, $npc_id, $level,
                 ($zonesn // 'unknown'),
+                (defined $version ? $version : -1),
                 ($era    // 'unknown'),
                 $item_id
             );
@@ -399,9 +465,10 @@ sub era_global_rare_loot_on_spawn {
 
     if ($debug && $added == 0) {
         my $msg = sprintf(
-            "[EraGlobalLoot] NO RARE for %s(%d) in %s era=%s (pool_size=%d)",
+            "[EraGlobalLoot] NO RARE for %s(%d) in %s(v%d) era=%s (pool_size=%d)",
             $npc_name, $npc_id,
             ($zonesn // 'unknown'),
+            (defined $version ? $version : -1),
             ($era    // 'unknown'),
             $pool_count
         );
