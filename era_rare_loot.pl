@@ -242,35 +242,37 @@ sub _egl_is_valid_target {
 
     return 0 if !$npc;
 
-    my $include_merchants  = $opt->{include_merchants}  // 0;
-    my $include_bankers    = $opt->{include_bankers}    // 0;
-    my $include_gmasters   = $opt->{include_guildmasters} // 0;
-    my $include_adv        = $opt->{include_adv_merchants} // 0;
-    my $include_tribute    = $opt->{include_tribute} // 0;
-    my $include_mounts     = $opt->{include_mounts}   // 0;
-    my $include_triggers   = $opt->{include_triggers} // 0;
-    my $include_noloot     = $opt->{include_noloot}   // 0;
+    my $include_merchants  = $opt->{include_merchants}      // 0;
+    my $include_bankers    = $opt->{include_bankers}        // 0;
+    my $include_gmasters   = $opt->{include_guildmasters}   // 0;
+    my $include_adv        = $opt->{include_adv_merchants}  // 0;
+    my $include_tribute    = $opt->{include_tribute}        // 0;
+    my $include_triggers   = $opt->{include_triggers}       // 0;
+    my $include_noloot     = $opt->{include_noloot}         // 0;
 
-    # Pets / Owned NPC
+    # Pets / Owned NPCs
     return 0 if $npc->IsPet();
     return 0 if $npc->GetOwnerID() != 0;
 
-    # Merchant / Banker / Guildmaster checks (no IsMerchant in older builds)
-    my $npc_class = $npc->GetClass();
+    # Class-based utility NPCs
+    my $npc_class = $npc->GetClass() || 0;
 
-    return 0 if !$include_merchants  && $npc_class == 41;  # Merchant
-    return 0 if !$include_bankers    && $npc_class == 40;  # Banker
-    return 0 if !$include_gmasters   && $npc_class == 20;  # Guildmaster
-    return 0 if !$include_adv        && $npc_class == 61;  # Adv Merchant
-    return 0 if !$include_tribute    && $npc_class == 63;  # Tribute
+    # Merchants / Bankers
+    return 0 if !$include_merchants && $npc_class == 41;   # Merchant
+    return 0 if !$include_bankers   && $npc_class == 40;   # Banker
 
-    # Skip invisible men / triggers
+    # Guildmasters: 20–35 = all guildmaster classes
+    if (!$include_gmasters && $npc_class >= 20 && $npc_class <= 35) {
+        return 0;
+    }
+
+    # LDoN / Tribute
+    return 0 if !$include_adv     && $npc_class == 61;     # Adventure Merchant
+    return 0 if !$include_tribute && $npc_class == 63;     # Tribute Master
+
+    # Skip invisible men / common triggers
     my $race = $npc->GetRace();
     return 0 if !$include_triggers && defined $race && $race == 127;
-
-    # Mounts: some servers use horse bodytype 11, others rely on name
-    my $body = $npc->GetBodyType();
-    return 0 if !$include_mounts && ($body == 11 || $npc->IsHorse());
 
     # Skip NPCs with no loottable
     my $ltid = $npc->GetLoottableID() || 0;
@@ -278,6 +280,7 @@ sub _egl_is_valid_target {
 
     return 1;
 }
+
 
 
 # ----------------------------------------------------------
