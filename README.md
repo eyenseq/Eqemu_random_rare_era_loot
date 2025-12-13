@@ -39,6 +39,8 @@ Full debugging output option
 
 Optional manual era override
 
+Optional Blacklists
+
 ## 📂 Requirements
 1. EQEmu server with Perl quest support
 
@@ -96,7 +98,15 @@ sub EVENT_SPAWN {
         min_loot_chance => 20.0,  # only include items with >=20% base drop %
         proc_chance_pct => 3.0,   # spawn has 3% chance to roll for rare loot
         rolls           => 1,     # maximum rare items added
+        ## Optional params ##
         debug           => 0      # enable debug while testing
+        # This line turns the plugin OFF for ANY spawn2 row whose version=1
+        blacklist_any_versions => [1],
+        # This line turns the plugin OFF for ANY spawn2 whose zonesn = listed zone
+        blacklist_zones => [ 'poknowledge', 'guildlobby' ],
+        # This line turns the plugin OFF for ANY spawn2 whose zonesn and version = listed zonesn, version
+        blacklist_zone_versions => {
+        soldungb => [2],
     );
 }
 ```
@@ -104,6 +114,7 @@ sub EVENT_SPAWN {
 Once added, every NPC spawn will automatically evaluate rare-era loot.
 
 ## ⚙ Configuration Options
+
 Option	Default	Description
 min_level	1	Ignore NPCs below this level
 max_level	255	Ignore NPCs above this level
@@ -113,6 +124,7 @@ proc_chance_pct	5.0	% chance per spawn to attempt a rare roll
 rolls	1	Maximum number of rare items added
 debug	0	Print detailed debug messages
 era	undef	Manually override era if needed
+
 ## 💾 How Loot Is Selected
 
 NPC spawns
