@@ -1,4 +1,4 @@
-♂package plugin;
+package plugin;
 
 use DBI;
 
@@ -478,3 +478,4 @@ sub era_global_rare_loot_on_spawn {
 }
 
 1;
+
