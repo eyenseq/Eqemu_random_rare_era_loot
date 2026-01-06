@@ -99,7 +99,7 @@ sub EVENT_SPAWN {
         proc_chance_pct => 3.0,   # spawn has 3% chance to roll for rare loot
         rolls           => 1,     # maximum rare items added
         ## Optional params ##
-        debug           => 0      # enable debug while testing
+        debug           => 0,      # enable debug while testing
         # This line turns the plugin OFF for ANY spawn2 row whose version=1
         blacklist_any_versions => [1],
         # This line turns the plugin OFF for ANY spawn2 whose zonesn = listed zone
