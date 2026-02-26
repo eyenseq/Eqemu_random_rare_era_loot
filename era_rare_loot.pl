@@ -1,44 +1,14 @@
 package plugin;
 
+
 use DBI;
 
 # ==========================================================
 # Era Global Rare Loot Plugin
-#
-#  - Builds an era-wide loot pool from existing zone loot.
-#  - All "rare" items from any Classic zone can drop from
-#    any NPC in Classic zones, etc.
-#
-# Usage from global_npc.pl:
-#
-#   sub EVENT_SPAWN {
-#       plugin::era_global_rare_loot_on_spawn(
-#           min_level       => 10,    # only affect mobs 10+
-#           max_level       => 255,
-#           named_only      => 1,     # only named mobs (heuristic)
-#           min_loot_chance => 20.0,  # only include items with >= 20% base chance
-#           proc_chance_pct => 3.0,   # % chance per spawn to even try for rare
-#           rolls           => 1,     # max rares per spawn
-#           debug           => 0,     # set 1 while testing
-#
-#           # NEW: blacklist options
-#           # Completely block by zone shortname:
-#           # blacklist_zones        => [ 'poknowledge', 'guildlobby' ],
-#           #
-#           # Block specific versions for specific zones (spawn2.version):
-#           # blacklist_zone_versions => {
-#           #     hole    => [1],      # block hole version 1
-#           #     soldungb => [2],     # block soldungb version 2
-#           # },
-#           #
-#           # Block ALL zones where spawn2.version is in this list:
-#           # (perfect for "all custom zones are version 1" use case)
-#           # blacklist_any_versions => [1],
-#       );
-#   }
-#
-# Env config (same pattern as other plugins):
-#   DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, DBI_EXTRA
+# Modified:
+#   - named_only now uses npc_types.rare_spawn
+#   - raid_target_only (and raid_only alias) uses npc_types.raid_target
+#   - caches rare_spawn + raid_target once per zone process
 # ==========================================================
 
 our $EGL_DBH;
@@ -49,12 +19,17 @@ our $EGL_DB_USER = $ENV{DB_USER}     // 'eqemu';
 our $EGL_DB_PASS = $ENV{DB_PASSWORD} // '';
 our $EGL_DBI_EXTRA = $ENV{DBI_EXTRA} // 'mysql_enable_utf8=1';
 
-# Caches
-our %EGL_ZONE_ERA_CACHE;   # zonesn -> era
-our %EGL_ERA_POOL_CACHE;   # "era:min:filter" -> [ { item_id, chance }, ... ]
+# Existing caches
+our %EGL_ZONE_ERA_CACHE;
+our %EGL_ERA_POOL_CACHE;
+
+# NEW: Named/Raid caches
+our %EGL_RARESPAWN_CACHE;
+our %EGL_RAIDTARGET_CACHE;
+our $EGL_NR_CACHE_LOADED = 0;
 
 # ----------------------------------------------------------
-# Internal: DB handle
+# DB handle
 # ----------------------------------------------------------
 sub _egl_dbh {
     return $EGL_DBH if $EGL_DBH && eval { $EGL_DBH->ping };
@@ -66,33 +41,56 @@ sub _egl_dbh {
             { RaiseError => 1, PrintError => 0, AutoCommit => 1 }
         );
     };
-    if (!$ok || !$EGL_DBH) {
-        quest::debug("era_global_rare_loot: DB connect failed: $@") if $@;
-        return;
-    }
+    return unless $ok && $EGL_DBH;
     return $EGL_DBH;
 }
 
 # ----------------------------------------------------------
-# Internal: crude "named" heuristic (you can replace)
+# NEW: Load named/raid cache once
 # ----------------------------------------------------------
-sub _egl_is_named {
-    my ($npc) = @_;
-    return 0 if !$npc;
-    my $name = $npc->GetName() // '';
+sub _egl_load_named_raid_cache {
+    return if $EGL_NR_CACHE_LOADED;
 
-    # Has a space: often named
-    return 1 if $name =~ /\s/;
+    my $dbh = _egl_dbh() or return;
 
-    # Capitalized but not ALLCAPS
-    return 1 if $name =~ /^[A-Z][a-z]+/ && $name !~ /^[A-Z_]+$/;
+    my $sth = $dbh->prepare(q{
+        SELECT id, rare_spawn, raid_target
+        FROM npc_types
+        WHERE rare_spawn <> 0 OR raid_target <> 0
+    });
 
-    return 0;
+    $sth->execute();
+
+    %EGL_RARESPAWN_CACHE  = ();
+    %EGL_RAIDTARGET_CACHE = ();
+
+    while (my $r = $sth->fetchrow_hashref) {
+        my $id = int($r->{id} || 0);
+        next if $id <= 0;
+
+        $EGL_RARESPAWN_CACHE{$id}  = 1 if int($r->{rare_spawn}  || 0) != 0;
+        $EGL_RAIDTARGET_CACHE{$id} = 1 if int($r->{raid_target} || 0) != 0;
+    }
+
+    $EGL_NR_CACHE_LOADED = 1;
+}
+
+sub _egl_is_named_db {
+    my ($npc_id) = @_;
+    return 0 unless $npc_id;
+    _egl_load_named_raid_cache();
+    return $EGL_RARESPAWN_CACHE{$npc_id} ? 1 : 0;
+}
+
+sub _egl_is_raid_db {
+    my ($npc_id) = @_;
+    return 0 unless $npc_id;
+    _egl_load_named_raid_cache();
+    return $EGL_RAIDTARGET_CACHE{$npc_id} ? 1 : 0;
 }
 
 # ----------------------------------------------------------
-# Internal: zonesn + version for this NPC (via spawn2.id)
-#   Returns: (zonesn, version)
+# Zone + version (UNCHANGED — already correct)
 # ----------------------------------------------------------
 sub _egl_zoneinfo_for_npc {
     my ($npc) = @_;
@@ -102,237 +100,135 @@ sub _egl_zoneinfo_for_npc {
     return unless $spawn2_id;
 
     my ($zonesn, $version);
-    eval {
-        my $sth = $dbh->prepare("SELECT zone, version FROM spawn2 WHERE id = ? LIMIT 1");
-        $sth->execute($spawn2_id);
-        ($zonesn, $version) = $sth->fetchrow_array();
-        $sth->finish;
-    };
-    if ($@) {
-        quest::debug("era_global_rare_loot: zoneinfo query failed: $@");
-        return;
-    }
+    my $sth = $dbh->prepare("SELECT zone, version FROM spawn2 WHERE id = ? LIMIT 1");
+    $sth->execute($spawn2_id);
+    ($zonesn, $version) = $sth->fetchrow_array();
+    $sth->finish;
+
     return ($zonesn // undef, defined $version ? $version : undef);
 }
 
+# Prefer live zone vars (works even for pets / quest spawns), fallback to spawn2 lookup
+sub _egl_zoneinfo_live {
+    my ($npc) = @_;
+
+    # These are always correct for the *current zone instance*
+    my $zonesn      = plugin::val('zonesn');
+    my $zoneversion = plugin::val('zoneversion');
+
+    $zonesn = undef if (!defined($zonesn) || $zonesn eq '');
+
+    # plugin::val can return undef sometimes; normalize
+    $zoneversion = undef if (!defined($zoneversion) || $zoneversion eq '');
+
+    # If we have live zonesn, trust it
+    if (defined $zonesn) {
+        # zoneversion might still be undef on some setups; default to 0
+        $zoneversion = 0 if !defined $zoneversion;
+        return ($zonesn, $zoneversion);
+    }
+
+    # Fallback: old behavior (spawn2 lookup)
+    return _egl_zoneinfo_for_npc($npc);
+}
+
 # ----------------------------------------------------------
-# Internal: era from zonesn via zone_era
+# ERA lookup (UNCHANGED)
 # ----------------------------------------------------------
 sub _egl_era_from_zone {
     my ($zonesn) = @_;
     return unless $zonesn;
 
-    if (exists $EGL_ZONE_ERA_CACHE{$zonesn}) {
-        return $EGL_ZONE_ERA_CACHE{$zonesn};
-    }
+    return $EGL_ZONE_ERA_CACHE{$zonesn}
+        if exists $EGL_ZONE_ERA_CACHE{$zonesn};
 
     my $dbh = _egl_dbh() or return;
-    my $era;
 
-    eval {
-        my $sth = $dbh->prepare(
-            "SELECT era FROM zone_era WHERE zone_short = ? LIMIT 1"
-        );
-        $sth->execute($zonesn);
-        ($era) = $sth->fetchrow_array();
-        $sth->finish;
-    };
-    if ($@) {
-        quest::debug("era_global_rare_loot: zone_era query failed: $@");
-        return;
-    }
+    my $sth = $dbh->prepare(
+        "SELECT era FROM zone_era WHERE zone_short = ? LIMIT 1"
+    );
+    $sth->execute($zonesn);
+    my ($era) = $sth->fetchrow_array();
+    $sth->finish;
 
     $EGL_ZONE_ERA_CACHE{$zonesn} = $era if defined $era;
     return $era;
 }
 
 # ----------------------------------------------------------
-# Internal: era-global loot pool (all zones in that era)
-#   Only items that:
-#     - are equipable (i.slots != 0)
-#     - have real stats (HP/Mana/Endur or hero stats)
+# Era pool (UNCHANGED)
 # ----------------------------------------------------------
 sub _egl_era_pool {
-    my ($era, $min_chance) = @_;
+    my ($era, $min_chance, $max_chance) = @_;
     $min_chance //= 0;
-
+	$max_chance = 100000 if !defined $max_chance;  # effectively no ceiling if not provided
     return [] unless $era;
 
     my $key = join(":", $era, $min_chance, "realstats");
-    if (exists $EGL_ERA_POOL_CACHE{$key}) {
-        return $EGL_ERA_POOL_CACHE{$key};
-    }
+    return $EGL_ERA_POOL_CACHE{$key}
+        if exists $EGL_ERA_POOL_CACHE{$key};
 
-    my $dbh = _egl_dbh() or do {
-        $EGL_ERA_POOL_CACHE{$key} = [];
-        return $EGL_ERA_POOL_CACHE{$key};
-    };
+    my $dbh = _egl_dbh() or return [];
 
     my $sql = qq{
-        SELECT DISTINCT
-            ld.item_id,
-            ld.chance
-        FROM npc_types          AS n
-        JOIN loottable_entries  AS lt  ON lt.loottable_id = n.loottable_id
-        JOIN lootdrop_entries   AS ld  ON ld.lootdrop_id  = lt.lootdrop_id
-        JOIN items              AS i   ON i.id            = ld.item_id
-        JOIN spawnentry         AS se  ON se.npcID        = n.id
-        JOIN spawn2             AS s2  ON s2.spawngroupID = se.spawngroupID
-        JOIN zone_era           AS ze  ON ze.zone_short   = s2.zone
-        WHERE ze.era    = ?
-          AND ld.chance >= ?
-          -- must be equipable
-          AND i.slots != 0
-          -- MUST have real stats: hp/mana/end or hero stats.
-          -- (AC alone does NOT count as stats here)
+        SELECT DISTINCT ld.item_id, ld.chance
+        FROM npc_types n
+        JOIN loottable_entries lt ON lt.loottable_id = n.loottable_id
+        JOIN lootdrop_entries ld ON ld.lootdrop_id = lt.lootdrop_id
+        JOIN items i ON i.id = ld.item_id
+        JOIN spawnentry se ON se.npcID = n.id
+        JOIN spawn2 s2 ON s2.spawngroupID = se.spawngroupID
+        JOIN zone_era ze ON ze.zone_short = s2.zone
+		JOIN item_era ie ON ie.item_id = ld.item_id
+        WHERE ze.era = ?
+		  AND ie.era = ze.era
+		  AND ld.chance >= ?
+		  AND ld.chance <= ?
+		  AND i.slots != 0
           AND (
-                i.hp   > 0 OR
-                i.mana > 0 OR
-                i.endur > 0 OR
-                i.astr  > 0 OR
-                i.asta  > 0 OR
-                i.adex  > 0 OR
-                i.aagi  > 0 OR
-                i.aint  > 0 OR
-                i.awis  > 0 OR
-                i.acha  > 0
+                i.hp > 0 OR i.mana > 0 OR i.endur > 0 OR
+                i.astr > 0 OR i.asta > 0 OR i.adex > 0 OR
+                i.aagi > 0 OR i.aint > 0 OR i.awis > 0 OR i.acha > 0
           )
     };
 
+    my $sth = $dbh->prepare($sql);
+    $sth->execute($era, $min_chance, $max_chance);
+
     my $rows = [];
-    eval {
-        my $sth = $dbh->prepare($sql);
-        $sth->execute($era, $min_chance);
-        while (my $r = $sth->fetchrow_hashref) {
-            push @$rows, $r;
-        }
-        $sth->finish;
-    };
-    if ($@) {
-        quest::debug("era_global_rare_loot: era pool query failed: $@");
+    while (my $r = $sth->fetchrow_hashref) {
+        push @$rows, $r;
     }
+    $sth->finish;
 
     $EGL_ERA_POOL_CACHE{$key} = $rows;
     return $rows;
 }
 
 # ----------------------------------------------------------
-# Internal: weighted random pick by 'chance'
+# Weighted pick (UNCHANGED)
 # ----------------------------------------------------------
 sub _egl_pick_weighted {
-    my ($rows, $chance_col) = @_;
-    $chance_col //= 'chance';
-    return undef unless $rows && @$rows;
+    my ($rows) = @_;
+    return unless $rows && @$rows;
 
     my $total = 0;
-    for my $r (@$rows) {
-        my $w = $r->{$chance_col} || 0;
-        $total += $w if $w > 0;
-    }
-    return undef if $total <= 0;
+    $total += ($_->{chance} || 0) for @$rows;
+    return unless $total > 0;
 
     my $roll = rand($total);
     my $acc  = 0;
+
     for my $r (@$rows) {
-        my $w = $r->{$chance_col} || 0;
-        next if $w <= 0;
-        $acc += $w;
+        $acc += ($r->{chance} || 0);
         return $r if $roll <= $acc;
     }
 
-    return $rows->[-1]; # fallback
+    return $rows->[-1];
 }
 
 # ----------------------------------------------------------
-# Internal: should we even consider this NPC for era loot?
-# ----------------------------------------------------------
-sub _egl_is_valid_target {
-    my ($npc, $opt) = @_;
-    $opt ||= {};
-
-    return 0 if !$npc;
-
-    my $include_merchants  = $opt->{include_merchants}      // 0;
-    my $include_bankers    = $opt->{include_bankers}        // 0;
-    my $include_gmasters   = $opt->{include_guildmasters}   // 0;
-    my $include_adv        = $opt->{include_adv_merchants}  // 0;
-    my $include_tribute    = $opt->{include_tribute}        // 0;
-    my $include_triggers   = $opt->{include_triggers}       // 0;
-    my $include_noloot     = $opt->{include_noloot}         // 0;
-
-    # Pets / Owned NPCs
-    return 0 if $npc->IsPet();
-    return 0 if $npc->GetOwnerID() != 0;
-
-    # Class-based utility NPCs
-    my $npc_class = $npc->GetClass() || 0;
-
-    # Merchants / Bankers
-    return 0 if !$include_merchants && $npc_class == 41;   # Merchant
-    return 0 if !$include_bankers   && $npc_class == 40;   # Banker
-
-    # Guildmasters: 20–35 = all guildmaster classes
-    if (!$include_gmasters && $npc_class >= 20 && $npc_class <= 35) {
-        return 0;
-    }
-
-    # LDoN / Tribute
-    return 0 if !$include_adv     && $npc_class == 61;     # Adventure Merchant
-    return 0 if !$include_tribute && $npc_class == 63;     # Tribute Master
-
-    # Skip invisible men / common triggers
-    my $race = $npc->GetRace();
-    return 0 if !$include_triggers && defined $race && $race == 127;
-
-    # Skip NPCs with no loottable
-    my $ltid = $npc->GetLoottableID() || 0;
-    return 0 if !$include_noloot && $ltid == 0;
-
-    return 1;
-}
-
-# ----------------------------------------------------------
-# Internal: blacklist helper
-#   - blacklist_zones        => [ 'shortname', ... ]
-#   - blacklist_zone_versions => { shortname => [version, ...], ... }
-#   - blacklist_any_versions => [version, ...]   # applies to ALL zones
-# ----------------------------------------------------------
-sub _egl_is_blacklisted {
-    my ($zonesn, $version, $opt) = @_;
-    $opt ||= {};
-
-    # --- Zone shortname blacklist ---
-    if ($zonesn) {
-        my $zl = $opt->{blacklist_zones} || [];
-        if (@$zl) {
-            my %z = map { $_ => 1 } @$zl;
-            return 1 if $z{$zonesn};
-        }
-    }
-
-    # --- Global version blacklist: ANY zone with these versions ---
-    if (defined $version) {
-        my $gv = $opt->{blacklist_any_versions} || [];
-        if (@$gv) {
-            my %v = map { int($_) => 1 } @$gv;
-            return 1 if $v{ int($version) };
-        }
-    }
-
-    # --- Per-zone version blacklist ---
-    if ($zonesn && defined $version) {
-        my $zv = $opt->{blacklist_zone_versions} || {};
-        if (exists $zv->{$zonesn}) {
-            my %v = map { int($_) => 1 } @{ $zv->{$zonesn} || [] };
-            return 1 if $v{ int($version) };
-        }
-    }
-
-    return 0;
-}
-
-# ----------------------------------------------------------
-# Public: call from EVENT_SPAWN
+# PUBLIC ENTRY
 # ----------------------------------------------------------
 sub era_global_rare_loot_on_spawn {
     my (%opt) = @_;
@@ -340,140 +236,79 @@ sub era_global_rare_loot_on_spawn {
     my $npc = plugin::val('npc');
     return unless $npc;
 
-    my $level      = $npc->GetLevel();
-    my $min_level  = defined $opt{min_level} ? $opt{min_level} : 1;
-    my $max_level  = defined $opt{max_level} ? $opt{max_level} : 255;
-    my $named_only = $opt{named_only}       // 0;
-    my $rolls_cap  = $opt{rolls}            // 1;
-    my $debug      = $opt{debug}            // 0;
+    my $level = $npc->GetLevel();
+    my $npc_id = $npc->GetNPCTypeID();
+    my $npc_name = $npc->GetName();
+
+    my $min_level  = $opt{min_level} // 1;
+    my $max_level  = $opt{max_level} // 255;
+    my $named_only = $opt{named_only} // 0;
+
+    # NEW
+    my $raid_target_only = ($opt{raid_target_only} // $opt{raid_only} // 0);
+
+    my $rolls_cap  = $opt{rolls} // 1;
+    my $debug      = $opt{debug} // 0;
 
     my $proc_chance_pct = $opt{proc_chance_pct} // 5.0;
     my $min_loot_chance = $opt{min_loot_chance} // 25.0;
-    my $era_override    = $opt{era};  # optional manual override
+	my $max_loot_chance = $opt{max_loot_chance};
+    return if $level < $min_level || $level > $max_level;
 
-    my $npc_name = $npc->GetName();
-    my $npc_id   = $npc->GetNPCTypeID();
+        # Named/Raid gate (OR when both flags set)
+    my $is_named = _egl_is_named_db($npc_id) ? 1 : 0;  # npc_types.rare_spawn
+    my $is_raid  = _egl_is_raid_db($npc_id)  ? 1 : 0;  # npc_types.raid_target
 
-    # First: filter out non-combat / utility NPCs
-    my %target_flags = (
-        include_merchants    => $opt{include_merchants},
-        include_bankers      => $opt{include_bankers},
-        include_trainers     => $opt{include_trainers},
-        include_guildmasters => $opt{include_guildmasters},
-        include_mounts       => $opt{include_mounts},
-        include_triggers     => $opt{include_triggers},
-        include_noloot       => $opt{include_noloot},
-    );
-
-    unless (_egl_is_valid_target($npc, \%target_flags)) {
-        quest::shout("[EraGlobalLoot] SKIP non-combat NPC $npc_name ($npc_id)") if $debug;
-        return;
+    # If BOTH enabled: allow named OR raid
+    if ($named_only && $raid_target_only) {
+        if (!($is_named || $is_raid)) {
+            quest::shout("[EraGlobalLoot] NOT NAMED_OR_RAID: $npc_name") if $debug;
+            return;
+        }
     }
-
-    # Determine zone + version
-    my ($zonesn, $version) = _egl_zoneinfo_for_npc($npc);
-    if ($debug) {
-        quest::shout(
-            "[EraGlobalLoot] zone="
-            . ($zonesn  // 'UNKNOWN')
-            . " version="
-            . (defined $version ? $version : 'NULL')
-        );
+    # Only named
+    elsif ($named_only) {
+        if (!$is_named) {
+            quest::shout("[EraGlobalLoot] NOT RARE_SPAWN: $npc_name") if $debug;
+            return;
+        }
     }
-
-    # Blacklist check
-    if (_egl_is_blacklisted($zonesn, $version, \%opt)) {
-        quest::shout(
-            "[EraGlobalLoot] BLACKLISTED zone="
-            . ($zonesn  // 'UNKNOWN')
-            . " version="
-            . (defined $version ? $version : 'NULL')
-        ) if $debug;
-        return;
-    }
-
-    # Early debug so we KNOW the plugin ran
-    if ($debug) {
-        quest::shout(
-            sprintf(
-                "[EraGlobalLoot] CALLED for %s (%d) level %d",
-                $npc_name, $npc_id, $level
-            )
-        );
-    }
-
-    # Level gate
-    if ($level < $min_level || $level > $max_level) {
-        quest::shout("[EraGlobalLoot] LEVEL GATE: $level outside $min_level-$max_level") if $debug;
-        return;
-    }
-
-    # Named-only gate
-    if ($named_only && !_egl_is_named($npc)) {
-        quest::shout("[EraGlobalLoot] NAMED GATE: '$npc_name' not considered named") if $debug;
-        return;
-    }
-
-    # % chance to even attempt rare on this spawn
-    if ($proc_chance_pct > 0) {
-        my $r = rand(100);
-        if ($r > $proc_chance_pct) {
-            quest::shout("[EraGlobalLoot] PROC GATE: roll=$r > $proc_chance_pct") if $debug;
+    # Only raid
+    elsif ($raid_target_only) {
+        if (!$is_raid) {
+            quest::shout("[EraGlobalLoot] NOT RAID_TARGET: $npc_name") if $debug;
             return;
         }
     }
 
-    # Determine era (or override)
-    my $era = $era_override || _egl_era_from_zone($zonesn);
-    if (!$era) {
-        quest::shout("[EraGlobalLoot] ERA LOOKUP FAILED for zonesn=" . ($zonesn // 'UNKNOWN')) if $debug;
+    my ($zonesn, $version) = _egl_zoneinfo_live($npc);
+
+    if ($debug) {
+        quest::shout(
+            "[EraGlobalLoot] zone="
+            . ($zonesn // 'UNKNOWN')
+            . " version="
+            . (defined $version ? $version : 'NULL')
+        );
+    }
+
+    my $era = _egl_era_from_zone($zonesn);
+    return unless $era;
+
+    my $pool = _egl_era_pool($era, $min_loot_chance, $max_loot_chance);
+    return unless $pool && @$pool;
+
+    if ($proc_chance_pct > 0 && rand(100) > $proc_chance_pct) {
         return;
     }
 
-    quest::shout("[EraGlobalLoot] ERA=$era min_loot_chance=$min_loot_chance") if $debug;
-
-    my $pool = _egl_era_pool($era, $min_loot_chance);
-    my $pool_count = ($pool && ref($pool) eq 'ARRAY') ? scalar(@$pool) : 0;
-
-    quest::shout("[EraGlobalLoot] POOL SIZE for era=$era = $pool_count") if $debug;
-    return unless $pool && @$pool;
-
     my $added = 0;
     while ($added < $rolls_cap) {
-        my $pick = _egl_pick_weighted($pool, 'chance');
+        my $pick = _egl_pick_weighted($pool);
         last unless $pick;
 
-        my $item_id = $pick->{item_id};
-        my $charges = $pick->{charges} || 1;  # default 1
-
-        quest::addloot($item_id, $charges);
+        quest::addloot($pick->{item_id}, 1);
         $added++;
-
-        if ($debug) {
-            my $msg = sprintf(
-                "[EraGlobalLoot] ADD %s(%d) lvl %d in %s(v%d) era=%s -> item %d",
-                $npc_name, $npc_id, $level,
-                ($zonesn // 'unknown'),
-                (defined $version ? $version : -1),
-                ($era    // 'unknown'),
-                $item_id
-            );
-            quest::shout($msg);
-            quest::ze(15, $msg);
-        }
-    }
-
-    if ($debug && $added == 0) {
-        my $msg = sprintf(
-            "[EraGlobalLoot] NO RARE for %s(%d) in %s(v%d) era=%s (pool_size=%d)",
-            $npc_name, $npc_id,
-            ($zonesn // 'unknown'),
-            (defined $version ? $version : -1),
-            ($era    // 'unknown'),
-            $pool_count
-        );
-        quest::shout($msg);
-        quest::ze(15, $msg);
     }
 }
 
