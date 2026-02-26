@@ -46,17 +46,15 @@ Optional Blacklists
 
 Place this plugin in your quests/plugins/ directory.
 
-2. SQL table: zone_era
+2. SQL tables: zone_era, era_order, item era
 
-Used to map zone shortnames to an era.
-```sql
-CREATE TABLE IF NOT EXISTS `zone_era` (
-  `zone_short` varchar(32) NOT NULL,
-  `era` varchar(32) NOT NULL,
-  PRIMARY KEY (`zone_short`),
-  KEY `idx_era` (`era`)
-  );
-```
+Run the provide sql files to create tables.
+
+zone_era    =>    Used to define what zones belong in what era (fallback method. used in item_era query.)
+
+era_order   =>    Era's expansion order (used in item_era query.)
+
+item_era    =>    List of all drop items_id tagged with era
 
 You define what each zone short name means (Classic, Kunark, Velious, etc.).
 
@@ -94,10 +92,13 @@ sub EVENT_SPAWN {
     plugin::era_global_rare_loot_on_spawn(
         min_level       => 10,    # only affect mobs 10+
         max_level       => 255,
-        named_only      => 1,     # only named mobs
+        named_only      => 0,     # only named mobs 0 no 1 yes
+        raid_only       => 0,     # NEW only raid mobs 0 no 1 yes
         min_loot_chance => 20.0,  # only include items with >=20% base drop %
-        proc_chance_pct => 3.0,   # spawn has 3% chance to roll for rare loot
+        max_loot_chance => 80.0,  # NEW  only include items with <=80% base drop %
+        proc_chance_pct => 35.0,   # spawn has 35% chance to roll for rare loot
         rolls           => 1,     # maximum rare items added
+        include_noloot   => 0,    # Include NPC's with no loot 0 no 1 yes
         ## Optional params ##
         debug           => 0,      # enable debug while testing
         # This line turns the plugin OFF for ANY spawn2 row whose version=1
@@ -110,20 +111,75 @@ sub EVENT_SPAWN {
     );
 }
 ```
+#Optional
+
+this will build an item list with items era tagged (have to have table item_era) If doesn't exist will fall back to another method.
+```
+REPLACE INTO item_era (item_id, era)
+SELECT
+  x.item_id,
+  eo.era
+FROM (
+  SELECT
+    ld.item_id,
+    MIN(eo.ord) AS min_ord
+  FROM npc_types n
+  JOIN loottable_entries lt ON lt.loottable_id = n.loottable_id
+  JOIN lootdrop_entries ld ON ld.lootdrop_id = lt.lootdrop_id
+  JOIN spawnentry se ON se.npcID = n.id
+  JOIN spawn2 s2 ON s2.spawngroupID = se.spawngroupID
+  JOIN zone_era ze ON ze.zone_short = s2.zone
+  JOIN era_order eo ON eo.era = ze.era
+  GROUP BY ld.item_id
+) x
+JOIN era_order eo ON eo.ord = x.min_ord;
+```
+and if you need to exclude zone versions
+```
+REPLACE INTO item_era (item_id, era)
+SELECT
+  x.item_id,
+  eo.era
+FROM (
+  SELECT
+    ld.item_id,
+    MIN(eo.ord) AS min_ord
+  FROM npc_types n
+  JOIN loottable_entries lt ON lt.loottable_id = n.loottable_id
+  JOIN lootdrop_entries ld ON ld.lootdrop_id = lt.lootdrop_id
+  JOIN spawnentry se ON se.npcID = n.id
+  JOIN spawn2 s2 ON s2.spawngroupID = se.spawngroupID
+  JOIN zone_era ze ON ze.zone_short = s2.zone
+  JOIN era_order eo ON eo.era = ze.era
+  WHERE COALESCE(s2.version,0) NOT IN (2)
+  GROUP BY ld.item_id
+) x
+JOIN era_order eo ON eo.ord = x.min_ord;
+```
+and if you need to exclude zones
+```
+REPLACE INTO item_era (item_id, era)
+SELECT
+  x.item_id,
+  eo.era
+FROM (
+  SELECT
+    ld.item_id,
+    MIN(eo.ord) AS min_ord
+  FROM npc_types n
+  JOIN loottable_entries lt ON lt.loottable_id = n.loottable_id
+  JOIN lootdrop_entries ld ON ld.lootdrop_id = lt.lootdrop_id
+  JOIN spawnentry se ON se.npcID = n.id
+  JOIN spawn2 s2 ON s2.spawngroupID = se.spawngroupID
+  JOIN zone_era ze ON ze.zone_short = s2.zone
+  JOIN era_order eo ON eo.era = ze.era
+  WHERE s2.zone NOT IN ('soldunga','soldungb')
+  GROUP BY ld.item_id
+) x
+JOIN era_order eo ON eo.ord = x.min_ord;
+```
 
 Once added, every NPC spawn will automatically evaluate rare-era loot.
-
-## ⚙ Configuration Options
-
-Option	Default	Description
-min_level	1	Ignore NPCs below this level
-max_level	255	Ignore NPCs above this level
-named_only	0	Only apply to named NPCs (name-based heuristic)
-min_loot_chance	25.0	Only pool items with base chance ≥ this value
-proc_chance_pct	5.0	% chance per spawn to attempt a rare roll
-rolls	1	Maximum number of rare items added
-debug	0	Print detailed debug messages
-era	undef	Manually override era if needed
 
 ## 💾 How Loot Is Selected
 
@@ -171,19 +227,6 @@ Example:
 [EraGlobalLoot] ERA=1 min_loot_chance=20
 [EraGlobalLoot] POOL SIZE for era=1 = 142
 [EraGlobalLoot] ADD a_goblin(12345) -> item 5012
-
-## 🧱 Example SQL for Assigning Eras
-```sql
-INSERT INTO zone_era (zone_short, era) VALUES
-('qeynos', classic),
-('qeynos2', classic),
-('blackburrow', classic),
-('gfaydark', classic),
-('crushbone', classic),
-
-('wakening', velious),
-('velketor', velious);
-```
 
 ## 📅 Suggested Era Mapping
 Era	Expansion
