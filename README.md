@@ -79,7 +79,7 @@ Save the plugin as:
 quests/plugins/era_global_rare_loot.pl
 
 
-Add/Import the SQL file for zone_era.
+Add/Import the SQL files.
 
 Populate the table with your era mapping (examples below).
 
