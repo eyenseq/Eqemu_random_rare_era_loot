@@ -1,6 +1,7 @@
 package plugin;
 
-
+use strict;
+use warnings;
 use DBI;
 
 # ==========================================================
@@ -22,6 +23,7 @@ our $EGL_DBI_EXTRA = $ENV{DBI_EXTRA} // 'mysql_enable_utf8=1';
 # Existing caches
 our %EGL_ZONE_ERA_CACHE;
 our %EGL_ERA_POOL_CACHE;
+our $EGL_HAS_ITEM_ERA;  # undef=unknown, 0=no, 1=yes
 
 # NEW: Named/Raid caches
 our %EGL_RARESPAWN_CACHE;
@@ -43,6 +45,28 @@ sub _egl_dbh {
     };
     return unless $ok && $EGL_DBH;
     return $EGL_DBH;
+}
+
+sub _egl_has_item_era_table {
+    return $EGL_HAS_ITEM_ERA if defined $EGL_HAS_ITEM_ERA;
+
+    my $dbh = _egl_dbh();
+    if (!$dbh) {
+        $EGL_HAS_ITEM_ERA = 0;
+        return 0;
+    }
+
+    my $ok = eval {
+        my $sth = $dbh->prepare("SHOW TABLES LIKE 'item_era'");
+        $sth->execute();
+        my ($t) = $sth->fetchrow_array();
+        $sth->finish();
+        $EGL_HAS_ITEM_ERA = $t ? 1 : 0;
+        1;
+    };
+
+    $EGL_HAS_ITEM_ERA = 0 if !$ok;
+    return $EGL_HAS_ITEM_ERA;
 }
 
 # ----------------------------------------------------------
@@ -159,18 +183,92 @@ sub _egl_era_from_zone {
 # Era pool (UNCHANGED)
 # ----------------------------------------------------------
 sub _egl_era_pool {
-    my ($era, $min_chance, $max_chance) = @_;
+    my ($era, $min_chance, $max_chance, $blacklist_versions) = @_;
     $min_chance //= 0;
-	$max_chance = 100000 if !defined $max_chance;  # effectively no ceiling if not provided
+    $max_chance = 100000 if !defined $max_chance;  # effectively no ceiling
+
+    $blacklist_versions ||= [];
+    $blacklist_versions = [] if ref($blacklist_versions) ne 'ARRAY';
+
+    # Normalize blacklist values to ints
+    my @bl = map { int($_) } grep { defined($_) } @$blacklist_versions;
+    @bl = grep { $_ >= 0 } @bl;
+
     return [] unless $era;
 
-    my $key = join(":", $era, $min_chance, "realstats");
-    return $EGL_ERA_POOL_CACHE{$key}
-        if exists $EGL_ERA_POOL_CACHE{$key};
+    # Include blacklist in cache key so different blacklists don't reuse same pool
+    my $bl_key = @bl ? join(",", @bl) : "none";
+    my $key = join(":", $era, $min_chance, $max_chance, "bl=$bl_key", "realstats");
+    return $EGL_ERA_POOL_CACHE{$key} if exists $EGL_ERA_POOL_CACHE{$key};
 
     my $dbh = _egl_dbh() or return [];
 
-    my $sql = qq{
+    # Build optional blacklist clause (only if @bl has values)
+    my $bl_clause = '';
+    if (@bl) {
+        $bl_clause = ' AND COALESCE(s2.version,0) NOT IN (' . join(',', ('?') x @bl) . ') ';
+    }
+
+    my $rows = [];
+
+    # -------------------------------
+    # PRIMARY: item_era-restricted pool (strict era purity)
+    # -------------------------------
+    if (_egl_has_item_era_table()) {
+
+        my $sql_item_era = qq{
+            SELECT DISTINCT ld.item_id, ld.chance
+            FROM npc_types n
+            JOIN loottable_entries lt ON lt.loottable_id = n.loottable_id
+            JOIN lootdrop_entries ld ON ld.lootdrop_id = lt.lootdrop_id
+            JOIN items i ON i.id = ld.item_id
+            JOIN spawnentry se ON se.npcID = n.id
+            JOIN spawn2 s2 ON s2.spawngroupID = se.spawngroupID
+            JOIN zone_era ze ON ze.zone_short = s2.zone
+            JOIN item_era ie ON ie.item_id = ld.item_id
+            WHERE ze.era = ?
+              AND ie.era = ?                 -- STRICT: item must be tagged to this era
+              __BL_CLAUSE__
+              AND ld.chance >= ?
+              AND ld.chance <= ?
+              AND i.slots != 0
+              AND (
+                    i.hp > 0 OR i.mana > 0 OR i.endur > 0 OR
+                    i.astr > 0 OR i.asta > 0 OR i.adex > 0 OR
+                    i.aagi > 0 OR i.aint > 0 OR i.awis > 0 OR i.acha > 0
+              )
+        };
+
+        $sql_item_era =~ s/__BL_CLAUSE__/$bl_clause/;
+
+        my $sth = $dbh->prepare($sql_item_era);
+
+        # Bind order must match placeholders:
+        # ze.era, ie.era, (bl...), min, max
+        my @bind = ($era, $era);
+        push @bind, @bl if @bl;
+        push @bind, ($min_chance, $max_chance);
+
+        my $ok = eval { $sth->execute(@bind); 1; };
+
+        if ($ok) {
+            while (my $r = $sth->fetchrow_hashref) {
+                push @$rows, $r;
+            }
+        }
+        $sth->finish() if $sth;
+
+        if ($rows && @$rows) {
+            $EGL_ERA_POOL_CACHE{$key} = $rows;
+            return $rows;
+        }
+        # else fall through to legacy method
+    }
+
+    # -------------------------------
+    # FALLBACK: legacy inferred pool (no item_era or empty)
+    # -------------------------------
+    my $sql_legacy = qq{
         SELECT DISTINCT ld.item_id, ld.chance
         FROM npc_types n
         JOIN loottable_entries lt ON lt.loottable_id = n.loottable_id
@@ -179,12 +277,11 @@ sub _egl_era_pool {
         JOIN spawnentry se ON se.npcID = n.id
         JOIN spawn2 s2 ON s2.spawngroupID = se.spawngroupID
         JOIN zone_era ze ON ze.zone_short = s2.zone
-		JOIN item_era ie ON ie.item_id = ld.item_id
         WHERE ze.era = ?
-		  AND ie.era = ze.era
-		  AND ld.chance >= ?
-		  AND ld.chance <= ?
-		  AND i.slots != 0
+          __BL_CLAUSE__
+          AND ld.chance >= ?
+          AND ld.chance <= ?
+          AND i.slots != 0
           AND (
                 i.hp > 0 OR i.mana > 0 OR i.endur > 0 OR
                 i.astr > 0 OR i.asta > 0 OR i.adex > 0 OR
@@ -192,14 +289,59 @@ sub _egl_era_pool {
           )
     };
 
-    my $sth = $dbh->prepare($sql);
-    $sth->execute($era, $min_chance, $max_chance);
+    $sql_legacy =~ s/__BL_CLAUSE__/$bl_clause/;
 
-    my $rows = [];
-    while (my $r = $sth->fetchrow_hashref) {
+    my $sth2 = $dbh->prepare($sql_legacy);
+
+    my @bind2 = ($era);
+    push @bind2, @bl if @bl;
+    push @bind2, ($min_chance, $max_chance);
+
+    $sth2->execute(@bind2);
+
+    $rows = [];
+    while (my $r = $sth2->fetchrow_hashref) {
         push @$rows, $r;
     }
-    $sth->finish;
+    $sth2->finish();
+
+    $EGL_ERA_POOL_CACHE{$key} = $rows;
+    return $rows;
+
+
+    # -------------------------------
+    # FALLBACK: legacy inferred pool (no item_era)
+    # (Still excludes version 2, because you want that)
+    # -------------------------------
+    my $sql_legacy = qq{
+        SELECT DISTINCT ld.item_id, ld.chance
+        FROM npc_types n
+        JOIN loottable_entries lt ON lt.loottable_id = n.loottable_id
+        JOIN lootdrop_entries ld ON ld.lootdrop_id = lt.lootdrop_id
+        JOIN items i ON i.id = ld.item_id
+        JOIN spawnentry se ON se.npcID = n.id
+        JOIN spawn2 s2 ON s2.spawngroupID = se.spawngroupID
+        JOIN zone_era ze ON ze.zone_short = s2.zone
+        WHERE ze.era = ?
+          AND (s2.version IS NULL OR s2.version <> 2)
+          AND ld.chance >= ?
+          AND ld.chance <= ?
+          AND i.slots != 0
+          AND (
+                i.hp > 0 OR i.mana > 0 OR i.endur > 0 OR
+                i.astr > 0 OR i.asta > 0 OR i.adex > 0 OR
+                i.aagi > 0 OR i.aint > 0 OR i.awis > 0 OR i.acha > 0
+          )
+    };
+
+    my $sth2 = $dbh->prepare($sql_legacy);
+    $sth2->execute($era, $min_chance, $max_chance);
+
+    $rows = [];
+    while (my $r = $sth2->fetchrow_hashref) {
+        push @$rows, $r;
+    }
+    $sth2->finish();
 
     $EGL_ERA_POOL_CACHE{$key} = $rows;
     return $rows;
@@ -250,11 +392,22 @@ sub era_global_rare_loot_on_spawn {
     my $rolls_cap  = $opt{rolls} // 1;
     my $debug      = $opt{debug} // 0;
 
+	my $include_noloot = $opt{include_noloot} // 0;
+
+
     my $proc_chance_pct = $opt{proc_chance_pct} // 5.0;
     my $min_loot_chance = $opt{min_loot_chance} // 25.0;
 	my $max_loot_chance = $opt{max_loot_chance};
     return if $level < $min_level || $level > $max_level;
 
+	# Skip NPCs with no base loottable unless explicitly allowed
+	if (!$include_noloot) {
+		my $ltid = int(eval { $npc->GetLoottableID() } || 0);
+		if ($ltid <= 0) {
+			quest::shout("[EraGlobalLoot] SKIP NO LOOTTABLE: $npc_name") if $debug;
+			return;
+		}
+	}
         # Named/Raid gate (OR when both flags set)
     my $is_named = _egl_is_named_db($npc_id) ? 1 : 0;  # npc_types.rare_spawn
     my $is_raid  = _egl_is_raid_db($npc_id)  ? 1 : 0;  # npc_types.raid_target
@@ -295,7 +448,8 @@ sub era_global_rare_loot_on_spawn {
     my $era = _egl_era_from_zone($zonesn);
     return unless $era;
 
-    my $pool = _egl_era_pool($era, $min_loot_chance, $max_loot_chance);
+    my $bl_versions = $opt{blacklist_any_versions} // [];
+	my $pool = _egl_era_pool($era, $min_loot_chance, $max_loot_chance, $bl_versions);
     return unless $pool && @$pool;
 
     if ($proc_chance_pct > 0 && rand(100) > $proc_chance_pct) {
